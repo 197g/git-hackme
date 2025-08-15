@@ -1,9 +1,10 @@
 use core::net::{IpAddr, SocketAddr};
 use std::collections::HashSet;
-use std::{ffi::OsString, fs, io::Error, path::Path, path::PathBuf};
+use std::{ffi::OsString, fs, io, path::Path, path::PathBuf};
 
 #[cfg(target_family = "unix")]
 use crate::configuration::{Isolate, SignedEphemeralKey};
+use crate::error::{Error, Operation};
 #[cfg(target_family = "unix")]
 use std::os::unix::{fs::OpenOptionsExt as _, process::CommandExt as _};
 
@@ -21,7 +22,7 @@ pub struct Cli {
     action: ActionFn,
 }
 
-type ActionFn = fn(&Cli, &Configuration) -> Result<(), std::io::Error>;
+type ActionFn = fn(&Cli, &Configuration) -> Result<(), Error>;
 
 pub struct GitShellWrapper {
     pub canonical: PathBuf,
@@ -50,21 +51,26 @@ impl Cli {
         let join_http;
         let action: ActionFn;
 
+        let eop_curdir = Operation::Generic("interpreting current directory as target");
+
         match args_str[..] {
             [] | [Some("help"), ..] | [Some("--help"), ..] => Self::exit_help(&binary, &[]),
-            [Some("shell")] => return Err(Self::exec_shell(config)),
+            [Some("shell")] => {
+                let err = Self::exec_shell(config);
+                return Err(Operation::Shell.capture()(err));
+            }
             [Some("init")] => {
                 target_repository = None;
                 join_http = None;
                 action = Self::action_check_init;
             }
             [Some("share")] => {
-                target_repository = Some(std::env::current_dir()?);
+                target_repository = Some(std::env::current_dir().map_err(eop_curdir.capture())?);
                 join_http = None;
                 action = Self::action_share;
             }
             [Some("unshare")] => {
-                target_repository = Some(std::env::current_dir()?);
+                target_repository = Some(std::env::current_dir().map_err(eop_curdir.capture())?);
                 join_http = None;
                 action = Self::action_unshare;
             }
@@ -118,16 +124,22 @@ impl Cli {
 
         let binary = GitShellWrapper {
             canonical: {
-                let dev_or_full = binary.canonicalize().map_or_else(
-                    |err| {
-                        if err.kind() == std::io::ErrorKind::NotFound {
-                            Ok(None)
-                        } else {
-                            Err(err)
-                        }
-                    },
-                    |canonical| Ok(Some(canonical)),
-                )?;
+                let eop_git =
+                    Operation::File("determining canonical git binary location", binary.clone());
+
+                let dev_or_full = binary
+                    .canonicalize()
+                    .map_or_else(
+                        |err| {
+                            if err.kind() == std::io::ErrorKind::NotFound {
+                                Ok(None)
+                            } else {
+                                Err(err)
+                            }
+                        },
+                        |canonical| Ok(Some(canonical)),
+                    )
+                    .map_err(eop_git.capture())?;
 
                 if let Some(canonical) = dev_or_full {
                     canonical
@@ -210,21 +222,18 @@ impl Cli {
     }
 
     #[cfg(not(target_family = "unix"))]
-    fn exec_shell(config: &Configuration) -> Error {
+    fn exec_shell(config: &Configuration) -> io::Error {
         panic!("Only target_family = unix supports git-shell and hosting")
     }
 
     #[cfg(target_family = "unix")]
-    fn exec_shell(config: &Configuration) -> Error {
+    fn exec_shell(config: &Configuration) -> io::Error {
         let cmd = std::env::var_os("SSH_ORIGINAL_COMMAND").unwrap();
         let mnemonic = std::env::var_os(Cli::VAR_PROJECT).unwrap();
 
         let options = config.options().unwrap();
 
-        let basedir = config
-            .runtime_dir()
-            .map_err(Self::runtime_dir_error)
-            .unwrap();
+        let basedir = config.runtime_dir();
 
         let src_dir = basedir.join(&mnemonic).join(&mnemonic);
         // As promised this should be a link.
@@ -327,12 +336,13 @@ impl Cli {
         opt: &Options,
         id: IdentityFile,
     ) -> Result<CertificateAuthority, Error> {
-        if !id.exists()? {
-            eprintln!("Creating Certificate Authority: {}", id.path.display());
-            id.generate(opt)?;
+        let eop = Operation::File("creating or renewing CA", id.path.clone());
+
+        if !id.exists().map_err(eop.capture())? {
+            id.generate(opt).map_err(eop.capture())?;
         }
 
-        id.into_ca(opt)
+        id.into_ca(opt).map_err(eop.capture())
     }
 
     /// We need symlinking, critically important for our security structure. That is in unsharing
@@ -346,40 +356,60 @@ impl Cli {
         ca: &CertificateAuthority,
         target: &Path,
     ) -> Result<SignedEphemeralKey, Error> {
-        let basedir = config.runtime_dir().map_err(Self::runtime_dir_error)?;
-        std::fs::create_dir_all(basedir)?;
+        let basedir = config.runtime_dir();
+        std::fs::create_dir_all(basedir)
+            .map_err(Operation::File("creating base directory", basedir.to_owned()).capture())?;
 
         let path = basedir.join(".ssh-new-ephemeral");
-        if path.try_exists()? {
-            std::fs::remove_file(&path)?;
+        if path.try_exists().map_err(
+            Operation::Generic("checking for existing ephemeral key directory").capture(),
+        )? {
+            std::fs::remove_file(&path).map_err(
+                Operation::File(
+                    "removing left-over ephemeral key directory",
+                    path.to_owned(),
+                )
+                .capture(),
+            )?;
         }
 
         if self.interfaces.is_empty() {
-            eprintln!("Couldn't determine any interface to share the project to.");
-            eprintln!("Hint: the key is always restricted to your current networks.");
-            return Err(std::io::ErrorKind::Other)?;
+            return Err(Error::UnsharableProject)?;
         }
 
         let temporary = ca.create_key(&self.binary, &self.interfaces, options, path)?;
+        // FIXME: rather everything else should be `Error` with tracking of what operation failed.
         let mnemonic = temporary.mnemonic(options)?;
 
         let fulldir = basedir.join(&mnemonic);
-        std::fs::create_dir(&fulldir)?;
+        std::fs::create_dir(&fulldir)
+            .map_err(Operation::File("creating shared directory", fulldir.clone()).capture())?;
 
         let path = fulldir.join("key");
+        std::fs::rename(basedir.join(".ssh-new-ephemeral"), &path)
+            .map_err(Operation::File("assigning project key", path.to_owned()).capture())?;
 
-        std::fs::rename(basedir.join(".ssh-new-ephemeral"), &path)?;
+        let eop = Operation::File("assigning project public key", fulldir.join("key.pub"));
         std::fs::rename(
             basedir.join(".ssh-new-ephemeral.pub"),
             fulldir.join("key.pub"),
-        )?;
+        )
+        .map_err(eop.capture())?;
+
+        let eop = Operation::File(
+            "assigning project signature key",
+            fulldir.join("key-cert.pub"),
+        );
+
         std::fs::rename(
             basedir.join(".ssh-new-ephemeral-cert.pub"),
             fulldir.join("key-cert.pub"),
-        )?;
+        )
+        .map_err(eop.capture())?;
 
+        let eop = Operation::File("linking project sources", fulldir.join(&mnemonic));
         // Create the project's direct link to the source repository
-        std::os::unix::fs::symlink(target, fulldir.join(&mnemonic))?;
+        std::os::unix::fs::symlink(target, fulldir.join(&mnemonic)).map_err(eop.capture())?;
 
         Ok(SignedEphemeralKey { path, mnemonic })
     }
@@ -389,11 +419,14 @@ impl Cli {
         config: &Configuration,
         find_project: Option<&str>,
     ) -> Result<(), Error> {
-        let basedir = config.runtime_dir().map_err(Self::runtime_dir_error)?;
-        std::fs::create_dir_all(basedir)?;
+        let basedir = config.runtime_dir();
+
+        let eop = Operation::File("recreating index for projects", basedir.to_owned());
+        std::fs::create_dir_all(basedir).map_err(eop.capture())?;
 
         let mut projects = vec![];
-        for project in std::fs::read_dir(basedir)? {
+        let eop = Operation::File("inspecting existing projects", basedir.to_owned());
+        for project in std::fs::read_dir(basedir).map_err(eop.capture())? {
             let Ok(project) = project else {
                 continue;
             };
@@ -427,10 +460,11 @@ impl Cli {
             config.username(),
         );
 
-        std::fs::create_dir_all(basedir)?;
-        std::fs::write(basedir.join("index.html"), index)?;
-        std::fs::write(basedir.join("style.css"), style)?;
-        std::fs::write(basedir.join("ssh_config.template"), ssh_config_template)?;
+        let fail = |file: &str| Operation::File("writing index file", basedir.join(file)).capture();
+        std::fs::write(basedir.join("index.html"), index).map_err(fail("index.html"))?;
+        std::fs::write(basedir.join("style.css"), style).map_err(fail("style.css"))?;
+        std::fs::write(basedir.join("ssh_config.template"), ssh_config_template)
+            .map_err(fail("style.css"))?;
 
         self.recommend_netdev(basedir, find_project)?;
         if let Some(find_project) = find_project {
@@ -459,7 +493,7 @@ impl Cli {
     }
 
     #[cfg(not(target_family = "unix"))]
-    fn recommend_netdev(&self, _: &Path, _: Option<&str>) -> Result<(), Error> {
+    fn recommend_netdev(&self, _: &Path, _: Option<&str>) -> Result<(), io::Error> {
         Ok(())
     }
 
@@ -548,7 +582,11 @@ impl Cli {
         }
 
         let recommender = basedir.join(".ssh-test");
-        std::fs::create_dir_all(&recommender)?;
+        let eop = Operation::File(
+            "creating SSH verification directory",
+            recommender.to_owned(),
+        );
+        std::fs::create_dir_all(&recommender).map_err(eop.capture())?;
         let into = recommender.join("clone");
         let _ = std::fs::remove_dir_all(&into);
         let into = Tempdir(into);
@@ -566,7 +604,11 @@ impl Cli {
         .unwrap();
 
         let joined = self.join_finalize(basedir, find_project, ssh_config.clone(), &target)?;
-        let output = self.git_checkout(joined, Some(into.0.as_path()))?;
+        let eop = Operation::File("verifying SSH checkout", recommender.to_owned());
+
+        let output = self
+            .git_checkout(joined, Some(into.0.as_path()))
+            .map_err(eop.capture())?;
 
         if !output.status.success() {
             let (diagnosis, recommendations): (Option<_>, &[&'static str]);
@@ -611,11 +653,11 @@ impl Cli {
         Ok(())
     }
 
-    pub fn act(&self, config: &Configuration) -> Result<(), std::io::Error> {
+    pub fn act(&self, config: &Configuration) -> Result<(), Error> {
         (self.action)(self, config)
     }
 
-    fn action_check_init(&self, config: &Configuration) -> Result<(), std::io::Error> {
+    fn action_check_init(&self, config: &Configuration) -> Result<(), Error> {
         let options = config.options()?;
         let ca = self.get_or_create_ca(options, config.identity_file())?;
         self.find_ca_or_warn(config, &ca)?;
@@ -625,7 +667,7 @@ impl Cli {
     }
 
     #[cfg(target_family = "unix")]
-    fn action_share(&self, config: &Configuration) -> Result<(), std::io::Error> {
+    fn action_share(&self, config: &Configuration) -> Result<(), Error> {
         let options = config.options()?;
         let ca = self.get_or_create_ca(options, config.identity_file())?;
 
@@ -633,16 +675,23 @@ impl Cli {
             return Ok(());
         };
 
-        let mnemonic = if let Some(mnemonic) = self.find_shared_project(config, path, &ca)? {
+        let mnemonic = if let Some(mnemonic) = self.find_shared_project(config, path, &ca).map_err(
+            Operation::File("searching through existing projects", path.to_owned()).capture(),
+        )? {
             mnemonic
         } else {
-            let signed = self.generate_and_sign_key(config, options, &ca, path)?;
+            let signed = self
+                .generate_and_sign_key(config, options, &ca, path)
+                .map_err(
+                    Operation::File("generating publicly accessible key", path.to_owned())
+                        .capture(),
+                )?;
             eprintln!("Generated new keyfile in {}", signed.path.display());
 
             signed.mnemonic(options)?
         };
 
-        let basedir = config.runtime_dir().map_err(Self::runtime_dir_error)?;
+        let basedir = config.runtime_dir();
         let project_dir = basedir.join(&mnemonic);
 
         let description = self.describe_project(path)?;
@@ -657,7 +706,7 @@ impl Cli {
     }
 
     #[cfg(not(target_family = "unix"))]
-    fn action_start(&self, _: &Configuration) -> Result<(), std::io::Error> {
+    fn action_start(&self, _: &Configuration) -> Result<(), Error> {
         panic!("Only target_family = unix supports git-shell and hosting")
     }
 
@@ -666,13 +715,16 @@ impl Cli {
         config: &Configuration,
         target: &Path,
         ca: &CertificateAuthority,
-    ) -> Result<Option<String>, std::io::Error> {
-        let basedir = config.runtime_dir().map_err(Self::runtime_dir_error)?;
-        let target = target.canonicalize()?;
+    ) -> Result<Option<String>, Error> {
+        let basedir = config.runtime_dir();
+        let target = target.canonicalize().map_err(
+            Operation::File("canonicalizing project directory", target.to_owned()).capture(),
+        )?;
 
         let shared = match basedir.read_dir() {
             Err(io) if io.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            other => other?,
+            other => other
+                .map_err(Operation::File("reading base directory", basedir.to_owned()).capture())?,
         };
 
         for entry in shared {
@@ -710,7 +762,7 @@ impl Cli {
         Ok(None)
     }
 
-    fn describe_project(&self, path: &Path) -> Result<project::Description, std::io::Error> {
+    fn describe_project(&self, path: &Path) -> Result<project::Description, Error> {
         if path.parent().is_none() {
             panic!("Trying to share the file root as a project, bad idea");
         }
@@ -719,18 +771,23 @@ impl Cli {
     }
 
     #[cfg(target_family = "unix")]
-    fn action_unshare(&self, config: &Configuration) -> Result<(), std::io::Error> {
-        let basedir = config.runtime_dir().map_err(Self::runtime_dir_error)?;
+    fn action_unshare(&self, config: &Configuration) -> Result<(), Error> {
+        let basedir = config.runtime_dir();
 
         let shared = match basedir.read_dir() {
             Err(io) if io.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            other => other?,
+            other => other.map_err(
+                Operation::File("reading runtime directory", basedir.to_owned()).capture(),
+            )?,
         };
 
         let targets: HashSet<_> = self
             .target_repository
             .iter()
-            .map(|path| path.canonicalize())
+            .map(|path| {
+                let eop = Operation::File("determining canonical path for", path.clone());
+                path.canonicalize().map_err(eop.capture())
+            })
             .collect::<Result<_, _>>()?;
 
         let mut count = 0;
@@ -814,37 +871,41 @@ impl Cli {
     }
 
     #[cfg(not(target_family = "unix"))]
-    fn action_unshare(&self, _: &Configuration) -> Result<(), std::io::Error> {
+    fn action_unshare(&self, _: &Configuration) -> Result<(), Error> {
         panic!("Only target_family = unix supports git-shell and hosting")
     }
 
-    fn action_clone(&self, config: &Configuration) -> Result<(), std::io::Error> {
+    fn action_clone(&self, config: &Configuration) -> Result<(), Error> {
         let Some(join) = self.join_url() else {
             return Ok(());
         };
 
-        if Self::detect_git_root()? {
+        let eop = Operation::JoiningProject(join.clone());
+
+        if Self::detect_git_root().map_err(eop.capture())? {
             eprintln!("Warning: Cloning anew. Use subcommand `git hackme restore` to modify an existing repository");
         }
 
         let joined = self.join(config, join)?;
         let into = self.target_repository.as_deref();
-        self.git_checkout(joined, into)?;
+        self.git_checkout(joined, into).map_err(eop.capture())?;
 
         Ok(())
     }
 
-    fn action_restore(&self, config: &Configuration) -> Result<(), std::io::Error> {
+    fn action_restore(&self, config: &Configuration) -> Result<(), Error> {
         let Some(join) = self.join_url() else {
             return Ok(());
         };
 
-        if !Self::detect_git_root()? {
+        let eop = Operation::JoiningProject(join.clone());
+
+        if !Self::detect_git_root().map_err(eop.capture())? {
             panic!("Use subcommand `git hackme clone` to clone a fresh repository. (Not running in a git repository).");
         };
 
-        let joined = self.join(config, join)?;
-        self.git_fixup_remote(joined)?;
+        let joined = self.join(config, join).map_err(eop.capture())?;
+        self.git_fixup_remote(joined).map_err(eop.capture())?;
 
         Ok(())
     }
@@ -873,7 +934,7 @@ impl Cli {
             .is_ok_and(|response| response.status() == 200)
     }
 
-    fn detect_git_root() -> Result<bool, Error> {
+    fn detect_git_root() -> Result<bool, io::Error> {
         let git_prefix = std::process::Command::new("git")
             .args(["rev-parse", "--show-prefix"])
             .stdin(std::process::Stdio::null())
@@ -884,7 +945,7 @@ impl Cli {
         Ok(git_prefix.success())
     }
 
-    fn runtime_dir_error(err: &std::io::Error) -> std::io::Error {
+    fn runtime_dir_error(err: &io::Error) -> io::Error {
         let kind = err.kind();
         std::io::Error::new(kind, err.to_string())
     }
@@ -900,15 +961,14 @@ impl Cli {
 
         assert!(horse_battery.chars().all(|ch| ch.is_ascii_graphic()));
 
-        let basedir = config.runtime_dir().map_err(Self::runtime_dir_error)?;
+        let basedir = config.runtime_dir();
         let joinbase = basedir.join(".join");
         let joindir = joinbase.join(horse_battery);
-        std::fs::create_dir_all(&joindir)?;
 
-        #[deprecated = "Network errors from ureq should not panic!"]
-        fn _ureq(err: ureq::Error) -> std::io::Error {
-            panic!("Ureq handling {}", err)
-        }
+        std::fs::create_dir_all(&joindir)
+            .map_err(Operation::Generic("creating key directory").capture())?;
+
+        let operation = Operation::GettingProjectFile;
 
         for part in ["key", "key.pub", "key-cert.pub"] {
             let file = joindir.join(part);
@@ -920,7 +980,9 @@ impl Cli {
                 segments.push(part);
             }
 
-            let response = ureq::get(url.as_str()).call().map_err(_ureq)?;
+            let response = ureq::get(url.as_str())
+                .call()
+                .map_err(operation.capture())?;
 
             assert!(response.status() == 200);
             let mut reader = response.into_body().into_reader();
@@ -929,9 +991,11 @@ impl Cli {
                 .truncate(true)
                 .write(true)
                 .mode(0o600)
-                .open(&file)?;
+                .open(&file)
+                .map_err(Operation::File("opening key file", file.clone()).capture())?;
 
-            std::io::copy(&mut reader, &mut writer)?;
+            std::io::copy(&mut reader, &mut writer)
+                .map_err(Operation::File("writing key file", file.clone()).capture())?;
         }
 
         let ssh_config = joindir.join("ssh_config");
@@ -953,7 +1017,8 @@ impl Cli {
         let mnemonic_host = format!("{horse_battery}.hackme.local");
 
         let key_config = self.templates.key_ssh_config(joindir, url, horse_battery);
-        std::fs::write(&ssh_config, key_config)?;
+        let eop = Operation::File("writing SSH configuration", ssh_config.clone());
+        std::fs::write(&ssh_config, key_config).map_err(eop.capture())?;
 
         Ok(Joined {
             mnemonic_host,
@@ -961,7 +1026,7 @@ impl Cli {
         })
     }
 
-    fn git_fixup_remote(&self, join: Joined) -> Result<(), std::io::Error> {
+    fn git_fixup_remote(&self, join: Joined) -> Result<(), io::Error> {
         fn is_hackme_host(out: std::process::Output) -> bool {
             out.status.success()
                 && std::str::from_utf8(&out.stdout)
@@ -1009,7 +1074,7 @@ impl Cli {
         &self,
         join: Joined,
         into: Option<&Path>,
-    ) -> Result<std::process::Output, std::io::Error> {
+    ) -> Result<std::process::Output, io::Error> {
         let ssh_command = join.ssh_command_as_git_config();
 
         let output = std::process::Command::new("git")
@@ -1045,13 +1110,19 @@ impl Cli {
         }
 
         for file in &authorized_keys {
-            if let Ok(file) = fs::File::open(file) {
-                let file = std::io::BufReader::new(file);
-                for line in std::io::BufRead::lines(file) {
-                    if line? == expected_line {
-                        return Ok(());
+            let eop = Operation::File("checking authorized_keys file", file.clone());
+
+            match fs::File::open(file) {
+                Ok(file) => {
+                    let file = std::io::BufReader::new(file);
+                    for line in std::io::BufRead::lines(file) {
+                        if line.map_err(eop.capture())? == expected_line {
+                            return Ok(());
+                        }
                     }
                 }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(other) => return Err(eop.capture()(other)),
             }
         }
 

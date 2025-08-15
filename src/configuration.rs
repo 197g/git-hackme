@@ -3,14 +3,14 @@ use bip39_lexical_data::WL_BIP39;
 use directories::{ProjectDirs, UserDirs};
 
 use std::{
-    fs,
-    io::Error,
+    fs, io,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
 
 use crate::{
     cli::{Cli, GitShellWrapper, LocalInterface},
+    error::{Error, Operation},
     template::Templates,
 };
 
@@ -19,7 +19,7 @@ pub struct Configuration {
     pub user: Option<UserDirs>,
     options: OnceLock<Options>,
     username: OnceLock<String>,
-    tempdir: OnceLock<Result<RuntimeDirectory, Error>>,
+    tempdir: OnceLock<RuntimeDirectory>,
 }
 
 enum RuntimeDirectory {
@@ -68,7 +68,7 @@ static SINGLETON: OnceLock<Configuration> = OnceLock::new();
 
 impl Configuration {
     pub fn get() -> Result<&'static Self, Error> {
-        let base = ProjectDirs::from("com.github", "HeroicKatora", env!("CARGO_PKG_NAME")).unwrap();
+        let base = ProjectDirs::from("com.github", "197g", env!("CARGO_PKG_NAME")).unwrap();
 
         Ok(SINGLETON.get_or_init(|| Configuration {
             base,
@@ -85,17 +85,19 @@ impl Configuration {
         }
 
         let file = self.base.config_dir().join("config.json");
+        let op = Operation::File("reading configuration file", file.clone());
 
-        if !file.try_exists()? {
+        if !file.try_exists().map_err(op.capture())? {
             return Ok(self.options.get_or_init(Options::default));
         }
 
-        let file = fs::File::open(file)?;
-        let options: Options = serde_json::de::from_reader(file)?;
+        let file = fs::File::open(file).map_err(op.capture())?;
+        let options: Options = serde_json::de::from_reader(file).map_err(op.capture())?;
+
         Ok(self.options.get_or_init(|| options))
     }
 
-    pub fn runtime_dir(&self) -> Result<&Path, &std::io::Error> {
+    pub fn runtime_dir(&self) -> &Path {
         let result = self.tempdir.get_or_init(|| {
             self.base
                 .runtime_dir()
@@ -103,15 +105,14 @@ impl Configuration {
                 .map_or_else(
                     |_err| {
                         let dir = std::env::temp_dir().join(env!("CARGO_PKG_NAME"));
-                        Ok(RuntimeDirectory::Tempdir(dir))
+                        RuntimeDirectory::Tempdir(dir)
                     },
-                    |appdir| Ok(RuntimeDirectory::AppDir(appdir.to_path_buf())),
+                    |appdir| RuntimeDirectory::AppDir(appdir.to_path_buf()),
                 )
         });
 
-        result.as_ref().map(|v| match v {
-            RuntimeDirectory::AppDir(dir) | RuntimeDirectory::Tempdir(dir) => dir.as_path(),
-        })
+        let (RuntimeDirectory::AppDir(dir) | RuntimeDirectory::Tempdir(dir)) = result;
+        dir.as_path()
     }
 
     pub fn username(&self) -> &str {
@@ -130,11 +131,11 @@ impl Configuration {
 }
 
 impl IdentityFile {
-    pub fn exists(&self) -> Result<bool, Error> {
+    pub fn exists(&self) -> Result<bool, io::Error> {
         self.path.try_exists()
     }
 
-    pub fn generate(&self, opt: &Options) -> Result<(), Error> {
+    pub fn generate(&self, opt: &Options) -> Result<(), io::Error> {
         std::fs::create_dir_all(&self.config_folder)?;
 
         let (ssh_keygen, opts) = opt.ssh_keygen.split_first().unwrap();
@@ -160,7 +161,7 @@ impl IdentityFile {
         Ok(())
     }
 
-    pub fn into_ca(self, opt: &Options) -> Result<CertificateAuthority, Error> {
+    pub fn into_ca(self, opt: &Options) -> Result<CertificateAuthority, io::Error> {
         let (ssh_keygen, opts) = opt.ssh_keygen.split_first().unwrap();
 
         let mut public_key = std::process::Command::new(ssh_keygen);
@@ -218,7 +219,8 @@ impl CertificateAuthority {
             .arg("-f")
             .arg(&path);
 
-        shell_out_to_command_success(create_key)?;
+        shell_out_to_command_success(create_key)
+            .map_err(Operation::File("creating key file", path.to_owned()).capture())?;
 
         let mut sign_key = std::process::Command::new(ssh_keygen);
 
@@ -263,7 +265,8 @@ impl CertificateAuthority {
             .args(["-O", &address_list])
             .arg(&path);
 
-        shell_out_to_command_success(sign_key)?;
+        shell_out_to_command_success(sign_key)
+            .map_err(Operation::File("creating signature file of", path.to_owned()).capture())?;
 
         Ok(SignedEphemeralKey { path, mnemonic })
     }
@@ -280,7 +283,8 @@ impl CertificateAuthority {
             .arg(key)
             .stdout(std::process::Stdio::piped());
 
-        shell_out_to_command_success(check_key)?;
+        let eop = Operation::File("checking key file", key.to_path_buf());
+        shell_out_to_command_success(check_key).map_err(eop.capture())?;
 
         Ok(true)
     }
@@ -305,12 +309,12 @@ impl CertificateAuthority {
         templates.authorized_keys("ssh-ed25519", &self.pub_b64)
     }
 
-    fn parse_rfc4716(out: &[u8]) -> Result<String, Error> {
+    fn parse_rfc4716(out: &[u8]) -> Result<String, io::Error> {
         const START: &str = "---- BEGIN SSH2 PUBLIC KEY ----";
         const END: &str = "---- END SSH2 PUBLIC KEY ----";
 
         let st = std::str::from_utf8(out)
-            .map_err(|err| Error::new(std::io::ErrorKind::InvalidData, err))?;
+            .map_err(|err| io::Error::new(std::io::ErrorKind::InvalidData, err))?;
 
         let mut data = None;
         let mut lines = st.lines();
@@ -362,11 +366,11 @@ impl CertificateAuthority {
         }
     }
 
-    fn parse_keytype(out: &[u8]) -> Result<CertificateAuthorityType, Error> {
+    fn parse_keytype(out: &[u8]) -> Result<CertificateAuthorityType, io::Error> {
         if out.ends_with(b"(ED25519)\n") {
             Ok(CertificateAuthorityType::Ed25519)
         } else {
-            Err(Error::other(
+            Err(io::Error::other(
                 "Unrecognized key type in fingerprint for certificate authority",
             ))
         }
@@ -405,22 +409,32 @@ impl SignedEphemeralKey {
             .arg(path)
             .args(["-E", "sha256"]);
 
-        let output = describe_key.output()?;
+        let output = describe_key
+            .output()
+            .map_err(Operation::ParseSshKeygen.capture())?;
+
         Self::parse_fingerprint(&output.stdout)
     }
 
     fn parse_fingerprint(stdout: &[u8]) -> Result<[u8; 32], Error> {
-        let text = std::str::from_utf8(stdout)
-            .map_err(|err| Error::new(std::io::ErrorKind::InvalidData, err))?;
+        let text = std::str::from_utf8(stdout).map_err(Operation::ParseSshKeygen.capture())?;
 
-        let start = text.find("SHA256:").unwrap();
+        let start = text.find("SHA256:").ok_or_else(|| {
+            Error::UnknownSshKeytype({
+                match text.split_once(":") {
+                    Some((ty, _)) => ty.to_owned(),
+                    None => text.to_owned(),
+                }
+            })
+        })?;
+
         let text = &text[start + 7..];
         let end = text.find(" ").unwrap();
         let text = &text[..end];
 
         let asb64: Vec<u8> = B64_STANDARD
             .decode(text)
-            .map_err(|err| Error::new(std::io::ErrorKind::InvalidData, err))?;
+            .map_err(Operation::ParseSshKeygen.capture())?;
 
         Ok(asb64.as_slice().try_into().unwrap())
     }
@@ -438,9 +452,9 @@ impl Default for Options {
     }
 }
 
-fn shell_out_to_command_success(mut command: std::process::Command) -> Result<(), Error> {
+fn shell_out_to_command_success(mut command: std::process::Command) -> Result<(), io::Error> {
     if !command.status()?.success() {
-        Err(std::io::Error::other("ssh-keygen failed"))
+        Err(io::Error::other("ssh-keygen failed"))
     } else {
         Ok(())
     }

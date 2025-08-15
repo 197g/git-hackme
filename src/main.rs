@@ -1,6 +1,7 @@
-/// All the IO and administration with the user.
 mod cli;
 mod configuration;
+/// All the IO and administration with the user.
+mod error;
 /// Interact with projects, gather description etc.
 mod project;
 mod template;
@@ -11,11 +12,11 @@ fn main() -> Exit {
 
 enum Exit {
     Ok,
-    Error(std::io::Error),
+    Error(error::Error),
     Bug(Box<dyn core::any::Any + Send + 'static>),
 }
 
-fn _do() -> Result<(), std::io::Error> {
+fn _do() -> Result<(), error::Error> {
     let config = configuration::Configuration::get()?;
     // Always verify options first.
     let _options = config.options()?;
@@ -28,7 +29,7 @@ fn _do() -> Result<(), std::io::Error> {
 
 impl<F> From<F> for Exit
 where
-    F: FnOnce() -> Result<(), std::io::Error> + std::panic::UnwindSafe,
+    F: FnOnce() -> Result<(), error::Error> + std::panic::UnwindSafe,
 {
     fn from(value: F) -> Self {
         match std::panic::catch_unwind(value) {
@@ -44,7 +45,18 @@ impl std::process::Termination for Exit {
         match self {
             Exit::Ok => std::process::ExitCode::SUCCESS,
             Exit::Error(err) => {
-                eprintln!("{err}");
+                let mut err: &dyn core::error::Error = &err;
+
+                loop {
+                    eprintln!("{err}");
+
+                    let Some(source) = err.source() else {
+                        break;
+                    };
+
+                    err = source;
+                }
+
                 std::process::ExitCode::FAILURE
             }
             Exit::Bug(bug) => {

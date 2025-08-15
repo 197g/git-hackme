@@ -15,6 +15,7 @@ readme = "Readme.md"
 base64 = "0.22"
 bip39-lexical-data = "1"
 directories = "6"
+quick-error = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tinytemplate = "1.2"

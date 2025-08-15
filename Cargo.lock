@@ -159,6 +159,7 @@ dependencies = [
  "bip39-lexical-data",
  "directories",
  "netdev",
+ "quick-error",
  "serde",
  "serde_json",
  "tinytemplate",
@@ -462,6 +463,12 @@ checksum = "d61789d7719defeb74ea5fe81f2fdfdbd28a803847077cecce2ff14e1472f6f1"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "quick-error"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
 
 [[package]]
 name = "quote"
