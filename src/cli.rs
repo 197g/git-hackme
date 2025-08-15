@@ -869,7 +869,7 @@ impl Cli {
             url.set_path(&format!("{mnemonic}/key-cert.pub"));
         }
 
-        ureq::request_url("GET", &url)
+        ureq::get(url.as_str())
             .call()
             .map_or(false, |response| response.status() == 200)
     }
@@ -921,10 +921,10 @@ impl Cli {
                 segments.push(part);
             }
 
-            let response = ureq::request_url("GET", &url).call().map_err(_ureq)?;
+            let response = ureq::get(url.as_str()).call().map_err(_ureq)?;
 
             assert!(response.status() == 200);
-            let mut reader = response.into_reader();
+            let mut reader = response.into_body().into_reader();
             let mut writer = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(true)
