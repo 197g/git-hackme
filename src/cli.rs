@@ -143,8 +143,8 @@ impl Cli {
             .into_iter()
             .flat_map(|intf| {
                 // FIXME: apply some filter lists here, maybe.
-                let ipv4 = intf.ipv4.iter().map(|&ip| netdev::ip::IpNet::from(ip));
-                let ipv6 = intf.ipv6.iter().map(|&ip| netdev::ip::IpNet::from(ip));
+                let ipv4 = intf.ipv4.iter().map(|&ip| netdev::ipnet::IpNet::from(ip));
+                let ipv6 = intf.ipv6.iter().map(|&ip| netdev::ipnet::IpNet::from(ip));
 
                 ipv4.chain(ipv6)
                     .map(|net| LocalInterface {
@@ -475,8 +475,8 @@ impl Cli {
                     _ => return None,
                 }
 
-                let ipv4 = intf.ipv4.iter().map(|&ip| netdev::ip::IpNet::from(ip));
-                let ipv6 = intf.ipv6.iter().map(|&ip| netdev::ip::IpNet::from(ip));
+                let ipv4 = intf.ipv4.iter().map(|&ip| netdev::ipnet::IpNet::from(ip));
+                let ipv6 = intf.ipv6.iter().map(|&ip| netdev::ipnet::IpNet::from(ip));
 
                 let Some(addr) = ipv4.chain(ipv6).next() else {
                     // Not up.

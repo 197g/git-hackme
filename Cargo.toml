@@ -28,4 +28,4 @@ whoami = "1.5"
 # with the machine through `libc` etc. The explicit scoping to Unix and Windows
 # in this case makes sure that no even scarier dependencies on `dlopen2` are
 # introduced.
-netdev = "0.25"
+netdev = "0.37"
