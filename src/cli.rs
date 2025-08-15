@@ -571,8 +571,7 @@ impl Cli {
         if !output.status.success() {
             let (diagnosis, recommendations): (Option<_>, &[&'static str]);
 
-            if std::str::from_utf8(&output.stderr)
-                .map_or(false, |st| st.contains("Connection refused"))
+            if std::str::from_utf8(&output.stderr).is_ok_and(|st| st.contains("Connection refused"))
             {
                 diagnosis = Some("Your SSH server is not reachable at port 22");
                 recommendations = &["sudo systemctl start sshd"];
@@ -857,7 +856,7 @@ impl Cli {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .map_or(false, |_| true)
+            .is_ok()
     }
 
     fn detect_server(sock: SocketAddr, project: Option<&str>) -> bool {
@@ -871,7 +870,7 @@ impl Cli {
 
         ureq::get(url.as_str())
             .call()
-            .map_or(false, |response| response.status() == 200)
+            .is_ok_and(|response| response.status() == 200)
     }
 
     fn detect_git_root() -> Result<bool, Error> {
@@ -895,7 +894,7 @@ impl Cli {
             panic!("Trying to join cannot-be-base URL, should be caught earlier");
         };
 
-        let Some(horse_battery) = segments.last() else {
+        let Some(horse_battery) = segments.rev().nth(0) else {
             panic!("Not an encoded name, obviously");
         };
 
@@ -966,7 +965,7 @@ impl Cli {
         fn is_hackme_host(out: std::process::Output) -> bool {
             out.status.success()
                 && std::str::from_utf8(&out.stdout)
-                    .map_or(false, |st| st.trim_end().ends_with(".hackme.local:"))
+                    .is_ok_and(|st| st.trim_end().ends_with(".hackme.local:"))
         }
 
         let ssh_command = join.ssh_command_as_git_config();
@@ -977,7 +976,7 @@ impl Cli {
             .stderr(std::process::Stdio::null())
             .output();
 
-        if !get_remote.map_or(false, is_hackme_host) {
+        if !get_remote.is_ok_and(is_hackme_host) {
             eprintln!("git config core.sshCommand {ssh_command}");
             panic!("Command must be ran in an older Hackme project but its origin URL is not a bare hackme.local domain");
         }

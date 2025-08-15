@@ -366,8 +366,7 @@ impl CertificateAuthority {
         if out.ends_with(b"(ED25519)\n") {
             Ok(CertificateAuthorityType::Ed25519)
         } else {
-            Err(Error::new(
-                std::io::ErrorKind::Other,
+            Err(Error::other(
                 "Unrecognized key type in fingerprint for certificate authority",
             ))
         }
@@ -441,10 +440,7 @@ impl Default for Options {
 
 fn shell_out_to_command_success(mut command: std::process::Command) -> Result<(), Error> {
     if !command.status()?.success() {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "ssh-keygen failed",
-        ))
+        Err(std::io::Error::other("ssh-keygen failed"))
     } else {
         Ok(())
     }
